@@ -3,4 +3,5 @@ pytest==9.1.1
 python-dotenv==1.2.2
 neo4j==6.2.0
 openai==2.46.0      # OpenAI, OpenRouter and Gemini (OpenAI-compatible endpoints)
+google-genai        # Gemini embedding API
 anthropic==1.11.0   # only needed when LLM_PROVIDER=anthropic

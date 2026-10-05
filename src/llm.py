@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import re
 import time
 from dataclasses import dataclass, fields
 from typing import Any
@@ -23,7 +24,7 @@ PROVIDERS = {
     "openrouter": {"key": "OPENROUTER_API_KEY", "base_url": "https://openrouter.ai/api/v1",
                    "chat": "openai/gpt-4o-mini", "embed": "openai/text-embedding-3-small"},
     "gemini": {"key": "GEMINI_API_KEY", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-               "chat": "gemini-2.5-flash-lite", "embed": "gemini-embedding-001"},
+               "chat": "gemini-3.5-flash-lite", "embed": "gemini-embedding-001"},
     "anthropic": {"key": "ANTHROPIC_API_KEY", "base_url": None,
                   "chat": "claude-opus-5-5", "embed": None},
 }
@@ -36,7 +37,7 @@ PRICES_PER_M = {
     "gpt-4.1-nano": (0.10, 0.40),
     "text-embedding-3-small": (0.02, 0.0),
     "text-embedding-3-large": (0.13, 0.0),
-    "gemini-2.5-flash-lite": (0.10, 0.40),
+    "gemini-3.5-flash-lite": (0.30, 2.50),
     # Gemini embedding pricing intentionally omitted: the current pricing page does not list gemini-embedding-001.
     "claude-opus-5-5": (4.00, 20.00),
     "claude-sonnet-5-5": (2.00, 10.00),
@@ -111,27 +112,39 @@ class MeteredLLM:
             self._chat_client = anthropic.Anthropic(api_key=os.environ[PROVIDERS["anthropic"]["key"]])
         else:
             self._chat_client = _openai_client(self.chat_provider)
-        self._embed_client = (self._chat_client if self.embed_provider == self.chat_provider
-                              else _openai_client(self.embed_provider))
+        if self.embed_provider == "gemini":
+            genai = importlib.import_module("google.genai")
+            self._embed_client = genai.Client(api_key=os.environ[PROVIDERS["gemini"]["key"]])
+        else:
+            self._embed_client = (self._chat_client if self.embed_provider == self.chat_provider
+                                  else _openai_client(self.embed_provider))
 
     def chat(self, prompt: str, json_mode: bool = False) -> str:
         start = time.perf_counter()
         if self.chat_provider == "anthropic":
             text, model, tokens_in, tokens_out = self._chat_anthropic(prompt)
         else:
-            if json_mode and self.chat_provider != "gemini":
-                response = self._chat_client.chat.completions.create(
-                    model=self.chat_model_id,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0,
-                    response_format={"type": "json_object"},
-                )
-            else:
-                response = self._chat_client.chat.completions.create(
-                    model=self.chat_model_id,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0,
-                )
+            for attempt in range(8):
+                try:
+                    if json_mode and self.chat_provider != "gemini":
+                        response = self._chat_client.chat.completions.create(
+                            model=self.chat_model_id,
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0,
+                            response_format={"type": "json_object"},
+                        )
+                    else:
+                        response = self._chat_client.chat.completions.create(
+                            model=self.chat_model_id,
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0,
+                        )
+                    break
+                except Exception as exc:
+                    retry_after = re.search(r"retry in ([0-9.]+)s", str(exc), re.IGNORECASE)
+                    if self.chat_provider != "gemini" or "429" not in str(exc) or attempt == 7:
+                        raise
+                    time.sleep(float(retry_after.group(1)) + 1 if retry_after else 20)
             text, model = response.choices[0].message.content or "", self.chat_model_id
             usage = response.usage
             tokens_in = usage.prompt_tokens if usage else 0
@@ -158,9 +171,23 @@ class MeteredLLM:
 
     def embed(self, text: str) -> list[float]:
         start = time.perf_counter()
-        response = self._embed_client.embeddings.create(model=self.embed_model_id, input=text)
-        tokens = getattr(response.usage, "prompt_tokens", 0) or 0   # some OpenAI-compatible APIs omit usage
+        if self.embed_provider == "gemini":
+            for attempt in range(3):
+                try:
+                    response = self._embed_client.models.embed_content(model=self.embed_model_id, contents=text)
+                    break
+                except Exception as exc:
+                    retry_after = re.search(r"retry in ([0-9.]+)s", str(exc), re.IGNORECASE)
+                    if "429" not in str(exc) or attempt == 2:
+                        raise
+                    time.sleep(float(retry_after.group(1)) + 1 if retry_after else 20)
+            tokens = getattr(getattr(response, "usage_metadata", None), "prompt_token_count", 0) or 0
+            embedding = response.embeddings[0].values
+        else:
+            response = self._embed_client.embeddings.create(model=self.embed_model_id, input=text)
+            tokens = getattr(response.usage, "prompt_tokens", 0) or 0
+            embedding = response.data[0].embedding
         self.usage += Usage(1, tokens, 0, price(self.embed_model_id, tokens), time.perf_counter() - start)
-        return [float(value) for value in response.data[0].embedding]
+        return [float(value) for value in embedding]
 
     __call__ = embed
